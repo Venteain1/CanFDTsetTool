@@ -8,7 +8,11 @@
 #include <rtdbg.h>
 #define USB_LOG LOG_D
 
-/* 描述符实现: 设备 + 配置 + 字符串 (双 CDC: CDC0 数据接口 + CDC1 控制台)
+/* 描述符实现: 设备 + 配置 + 字符串（三路 CDC：CAN1 / CAN2 / 控制台）
+ *
+ * 端点预算：STM32G4 只有 8 个端点（EP0~EP7），而每个 CDC 需要 1 个中断 IN
+ * 加一对 bulk IN/OUT。这里让每个 CDC 的 bulk IN/OUT **共用同一个端点编号**
+ * （方向不同，USB 允许），于是 3 个 CDC 只占用 6 个编号 + EP0 = 7 个。
  *
  * VID/PID 使用 STM32 虚拟串口 (0483:5740)，序列号以 "AAA" 开头，
  * 这样 CANgaroo 的 SLCAN 驱动会把它识别成支持 CAN FD + 自定义速率的
@@ -36,31 +40,39 @@ uint8_t const desc_device[] = {
 
 /* 配置描述符：使用 TinyUSB CDC helper */
 enum {
-    ITF_NUM_CDC0 = 0,
+    ITF_NUM_CDC0 = 0,      /* CAN1 */
     ITF_NUM_CDC0_DATA,
-    ITF_NUM_CDC1,
+    ITF_NUM_CDC1,          /* CAN2 */
     ITF_NUM_CDC1_DATA,
+    ITF_NUM_CDC2,          /* 控制台 */
+    ITF_NUM_CDC2_DATA,
     ITF_NUM_TOTAL
 };
 
-/* 端点分配：保持奇数 IN, 偶数 OUT，避免冲突
- * CDC0: Notif EP1 IN (0x81), Data OUT EP2 (0x02), Data IN EP3 (0x83)
- * CDC1: Notif EP4 IN (0x84), Data OUT EP5 (0x05), Data IN EP6 (0x86)
+/* 端点分配：每个 CDC 的 bulk IN/OUT 共用编号，只占 2 个端点号
+ * CDC0 (CAN1):   Notif EP1 IN (0x81), Data EP2 OUT (0x02) / IN (0x82)
+ * CDC1 (CAN2):   Notif EP3 IN (0x83), Data EP4 OUT (0x04) / IN (0x84)
+ * CDC2 (console):Notif EP5 IN (0x85), Data EP6 OUT (0x06) / IN (0x86)
  */
 #define EPNUM_CDC0_NOTIF  0x81
 #define EPNUM_CDC0_OUT    0x02
-#define EPNUM_CDC0_IN     0x83
+#define EPNUM_CDC0_IN     0x82
 
-#define EPNUM_CDC1_NOTIF  0x84
-#define EPNUM_CDC1_OUT    0x05
-#define EPNUM_CDC1_IN     0x86
+#define EPNUM_CDC1_NOTIF  0x83
+#define EPNUM_CDC1_OUT    0x04
+#define EPNUM_CDC1_IN     0x84
 
-#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN*2)
+#define EPNUM_CDC2_NOTIF  0x85
+#define EPNUM_CDC2_OUT    0x06
+#define EPNUM_CDC2_IN     0x86
+
+#define CONFIG_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN*3)
 
 uint8_t const desc_configuration[] = {
         TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x80, 50),
         TUD_CDC_DESCRIPTOR(ITF_NUM_CDC0, 0, EPNUM_CDC0_NOTIF, 8, EPNUM_CDC0_OUT, EPNUM_CDC0_IN, 64),
-        TUD_CDC_DESCRIPTOR(ITF_NUM_CDC1, 0, EPNUM_CDC1_NOTIF, 8, EPNUM_CDC1_OUT, EPNUM_CDC1_IN, 64)
+        TUD_CDC_DESCRIPTOR(ITF_NUM_CDC1, 0, EPNUM_CDC1_NOTIF, 8, EPNUM_CDC1_OUT, EPNUM_CDC1_IN, 64),
+        TUD_CDC_DESCRIPTOR(ITF_NUM_CDC2, 0, EPNUM_CDC2_NOTIF, 8, EPNUM_CDC2_OUT, EPNUM_CDC2_IN, 64)
 };
 
 /* 字符串表 */
@@ -77,7 +89,7 @@ static uint16_t _desc_str[32];
 
 void tud_cdc_rx_cb(uint8_t itf)
 {
-    
+    (void)itf;
 }
 
 /* 回调: 设备描述符 */
@@ -117,7 +129,7 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid)
 }
 
 /* CDC line state (DTR) 跟踪 */
-static volatile bool g_dtr[CFG_TUD_CDC] = {false,false}; /* 每个 CDC 端口的 DTR */
+static volatile bool g_dtr[CFG_TUD_CDC]; /* 每个 CDC 端口的 DTR */
 
 void tud_cdc_line_state_cb(uint8_t itf, bool dtr, bool rts)
 {
@@ -138,7 +150,7 @@ bool tinyusb_cdc_ready(void)
 
 bool tinyusb_cdc_console_ready(void)
 {
-    return tud_cdc_n_connected(1) && g_dtr[1]; /* CDC1 控制台口 */
+    return tud_cdc_n_connected(2) && g_dtr[2]; /* CDC2 控制台口 */
 }
 
 int tinyusb_cdc_write(const uint8_t *data, rt_size_t len)
@@ -149,42 +161,69 @@ int tinyusb_cdc_write(const uint8_t *data, rt_size_t len)
     return (int)w;
 }
 
-/* SLCAN 数据通道：不依赖 DTR，只要 USB 已连接就写 */
-int tinyusb_cdc_write_force(const uint8_t *data, rt_size_t len)
+/* ---- 通用 CDC 接口（SLCAN 数据通道用，不依赖 DTR） ---- */
+
+bool tinyusb_cdc_n_connected(uint8_t itf)
+{
+    if (itf >= CFG_TUD_CDC) return false;
+    return tud_cdc_n_connected(itf);
+}
+
+int tinyusb_cdc_n_write(uint8_t itf, const uint8_t *data, rt_size_t len)
 {
     uint32_t w;
 
+    if (itf >= CFG_TUD_CDC) return 0;
     if (!data || len == 0) return 0;
-    if (!tud_cdc_n_connected(0)) return 0;
+    if (!tud_cdc_n_connected(itf)) return 0;
 
-    w = tud_cdc_n_write(0, data, (uint32_t)len);
-    if (w > 0) tud_cdc_n_write_flush(0);
+    w = tud_cdc_n_write(itf, data, (uint32_t)len);
+    if (w > 0) tud_cdc_n_write_flush(itf);
 
     return (int)w;
 }
 
-int tinyusb_cdc_read(uint8_t *data, rt_size_t len)
+int tinyusb_cdc_n_read(uint8_t itf, uint8_t *data, rt_size_t len)
 {
     uint32_t avail;
 
+    if (itf >= CFG_TUD_CDC) return 0;
     if (!data || len == 0) return 0;
-    if (!tud_cdc_n_connected(0)) return 0;
+    if (!tud_cdc_n_connected(itf)) return 0;
 
-    avail = tud_cdc_n_available(0);
+    avail = tud_cdc_n_available(itf);
     if (avail == 0) return 0;
     if (len > avail) len = avail;
 
-    return (int)tud_cdc_n_read(0, data, (uint32_t)len);
+    return (int)tud_cdc_n_read(itf, data, (uint32_t)len);
+}
+
+void tinyusb_cdc_n_flush(uint8_t itf)
+{
+    if (itf >= CFG_TUD_CDC) return;
+    tud_cdc_n_read_flush(itf);
+}
+
+/* ---- CDC0 便捷封装（usb_test / SLCAN CAN1） ---- */
+
+int tinyusb_cdc_write_force(const uint8_t *data, rt_size_t len)
+{
+    return tinyusb_cdc_n_write(0, data, len);
+}
+
+int tinyusb_cdc_read(uint8_t *data, rt_size_t len)
+{
+    return tinyusb_cdc_n_read(0, data, len);
 }
 
 void tinyusb_cdc_flush_input(void)
 {
-    tud_cdc_n_read_flush(0);
+    tinyusb_cdc_n_flush(0);
 }
 
 bool tinyusb_cdc_connected(void)
 {
-    return tud_cdc_n_connected(0);
+    return tinyusb_cdc_n_connected(0);
 }
 
 int tinyusb_cdc_console_write(const uint8_t *data, rt_size_t len)
@@ -199,11 +238,11 @@ int tinyusb_cdc_console_write(const uint8_t *data, rt_size_t len)
     while (offset < len && tinyusb_cdc_console_ready())
     {
         rt_size_t remain = len - offset; /* 剩余字节数 */
-        uint32_t avail = tud_cdc_n_write_available(1); /* 当前缓冲可写容量 */
+        uint32_t avail = tud_cdc_n_write_available(2); /* 当前缓冲可写容量 */
         if (avail == 0)
         {
             if (wait_ms >= max_wait_ms) {
-                USB_LOG("CDC1 no space timeout remain=%u\r\n", (unsigned)remain);
+                USB_LOG("CDC2 no space timeout remain=%u\r\n", (unsigned)remain);
                 break;
             }
             rt_thread_mdelay(1);
@@ -212,11 +251,11 @@ int tinyusb_cdc_console_write(const uint8_t *data, rt_size_t len)
         }
 
         uint32_t chunk = (uint32_t)(remain > avail ? avail : remain);
-        uint32_t w = tud_cdc_n_write(1, data + offset, chunk);
+        uint32_t w = tud_cdc_n_write(2, data + offset, chunk);
         if (w == 0)
         {
             if (wait_ms >= max_wait_ms) {
-                USB_LOG("CDC1 write stalled timeout remain=%u\r\n", (unsigned)remain);
+                USB_LOG("CDC2 write stalled timeout remain=%u\r\n", (unsigned)remain);
                 break;
             }
             rt_thread_mdelay(1);
@@ -226,7 +265,7 @@ int tinyusb_cdc_console_write(const uint8_t *data, rt_size_t len)
 
         offset += w;
         wait_ms = 0;
-        tud_cdc_n_write_flush(1);
+        tud_cdc_n_write_flush(2);
     }
 
     return (int)offset;
@@ -235,8 +274,8 @@ int tinyusb_cdc_console_write(const uint8_t *data, rt_size_t len)
 int tinyusb_cdc_console_getchar(void)
 {
     if (!tinyusb_cdc_console_ready()) return -1;
-    if (tud_cdc_n_available(1)) {
-        int ch = (int)tud_cdc_n_read_char(1);
+    if (tud_cdc_n_available(2)) {
+        int ch = (int)tud_cdc_n_read_char(2);
         return ch;
     }
     return -1;
@@ -275,7 +314,7 @@ int usb_test(int argc, char **argv)
     }
     const char *msg = "hello world!\r\n";
     int sent = tinyusb_cdc_write((const uint8_t*)msg, strlen(msg));
-    rt_kprintf("usb_test sent %d bytes\n, one time available %d\n", sent, tud_cdc_n_write_available(1));
+    rt_kprintf("usb_test sent %d bytes\n, one time available %d\n", sent, tud_cdc_n_write_available(0));
     return 0;
 }
 MSH_CMD_EXPORT(usb_test, send hello world over CDC0);

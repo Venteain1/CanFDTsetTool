@@ -6,7 +6,7 @@
  * Change Logs:
  * Date           Author       Notes
  * 2025-03-05     BZH1WX       the first version
- * 2025-11-03     Venteain     增加 SLCAN-FD 通道与运行时波特率配置
+ * 2025-11-03     Venteain     增加 SLCAN 双通道与运行时波特率配置
  */
 
 #include "stm32g4xx_hal.h"
@@ -26,16 +26,25 @@
 /* FDCAN 内核时钟：PCLK1（drv_clk.c 中 APB1 不分频，170 MHz） */
 #define FDCAN_KERNEL_CLK_HZ        170000000u
 
-/* CAN1 作为 SLCAN 通道的默认速率，可被上位机的 S/Y 命令改写 */
-#define CAN1_DEFAULT_NOMINAL_BPS   500000u
-#define CAN1_DEFAULT_DATA_BPS      2000000u
+/* 两路总线作为 SLCAN 通道的默认速率，可被上位机的 S/Y 命令改写 */
+#define CAN_DEFAULT_NOMINAL_BPS    500000u
+#define CAN_DEFAULT_DATA_BPS       2000000u
+
+#define CAN_BUS_COUNT              2
 
 void can_rxthread_entry(void *parameter);
 FDCAN_HandleTypeDef hfdcan1;
 FDCAN_HandleTypeDef hfdcan2;
 
-static struct rt_mutex can1_lock;
-static rt_bool_t        can1_lock_ready = RT_FALSE;
+static FDCAN_HandleTypeDef *const can_handle[CAN_BUS_COUNT] = { &hfdcan1, &hfdcan2 };
+
+typedef struct
+{
+    struct rt_mutex lock;
+    rt_bool_t       lock_ready;
+} can_bus_ctx_t;
+
+static can_bus_ctx_t can_ctx[CAN_BUS_COUNT];
 
 static const uint8_t _dlc_len_map[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64 };
 
@@ -139,21 +148,20 @@ static rt_bool_t fdcan_find_timing(uint32_t fclk, uint32_t bitrate, rt_bool_t da
 }
 
 /* ------------------------------------------------------------------ */
-/* CAN1 硬件配置                                                       */
+/* 硬件配置                                                            */
 /* ------------------------------------------------------------------ */
 
-static void can1_hw_defaults(void)
+static void can_hw_defaults(FDCAN_HandleTypeDef *h)
 {
-    hfdcan1.Instance = FDCAN1;
-    hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
-    hfdcan1.Init.FrameFormat = FDCAN_FRAME_FD_BRS;
-    hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
-    hfdcan1.Init.AutoRetransmission = ENABLE;
-    hfdcan1.Init.TransmitPause = ENABLE;
-    hfdcan1.Init.ProtocolException = DISABLE;
-    hfdcan1.Init.StdFiltersNbr = 28;
-    hfdcan1.Init.ExtFiltersNbr = 8;
-    hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
+    h->Init.ClockDivider        = FDCAN_CLOCK_DIV1;
+    h->Init.FrameFormat         = FDCAN_FRAME_FD_BRS;
+    h->Init.Mode                = FDCAN_MODE_NORMAL;
+    h->Init.AutoRetransmission  = ENABLE;
+    h->Init.TransmitPause       = ENABLE;
+    h->Init.ProtocolException   = DISABLE;
+    h->Init.StdFiltersNbr       = 28;
+    h->Init.ExtFiltersNbr       = 8;
+    h->Init.TxFifoQueueMode     = FDCAN_TX_FIFO_OPERATION;
 }
 
 static void can_gpio_init(void)
@@ -218,87 +226,96 @@ static rt_err_t can_config_filters(FDCAN_HandleTypeDef *hcan)
     return RT_EOK;
 }
 
-/* 应用新的位时序（调用者需保证不并发访问 CAN1） */
-static rt_err_t can1_apply(uint32_t nominal_bps, uint32_t data_bps, rt_bool_t listen_only)
+/* 应用新的位时序（调用者需保证不并发访问该总线） */
+static rt_err_t can_bus_apply(int bus, uint32_t nominal_bps, uint32_t data_bps, rt_bool_t listen_only)
 {
+    FDCAN_HandleTypeDef *h;
     uint32_t np, nt1, nt2, nsjw;
     uint32_t dp, dt1, dt2, dsjw;
 
+    if (bus < 0 || bus >= CAN_BUS_COUNT) return -RT_EINVAL;
+    h = can_handle[bus];
+
     if (!fdcan_find_timing(FDCAN_KERNEL_CLK_HZ, nominal_bps, RT_FALSE, &np, &nt1, &nt2, &nsjw))
     {
-        LOG_E("no nominal timing for %u bps", nominal_bps);
+        LOG_E("CAN%d: no nominal timing for %u bps", bus + 1, nominal_bps);
         return -RT_EINVAL;
     }
     if (!fdcan_find_timing(FDCAN_KERNEL_CLK_HZ, data_bps, RT_TRUE, &dp, &dt1, &dt2, &dsjw))
     {
-        LOG_E("no data timing for %u bps", data_bps);
+        LOG_E("CAN%d: no data timing for %u bps", bus + 1, data_bps);
         return -RT_EINVAL;
     }
 
-    (void)HAL_FDCAN_Stop(&hfdcan1);
+    (void)HAL_FDCAN_Stop(h);
 
-    hfdcan1.Init.NominalPrescaler     = np;
-    hfdcan1.Init.NominalSyncJumpWidth = nsjw;
-    hfdcan1.Init.NominalTimeSeg1      = nt1;
-    hfdcan1.Init.NominalTimeSeg2      = nt2;
-    hfdcan1.Init.DataPrescaler        = dp;
-    hfdcan1.Init.DataSyncJumpWidth    = dsjw;
-    hfdcan1.Init.DataTimeSeg1         = dt1;
-    hfdcan1.Init.DataTimeSeg2         = dt2;
-    hfdcan1.Init.Mode = listen_only ? FDCAN_MODE_BUS_MONITORING : FDCAN_MODE_NORMAL;
+    h->Init.NominalPrescaler     = np;
+    h->Init.NominalSyncJumpWidth = nsjw;
+    h->Init.NominalTimeSeg1      = nt1;
+    h->Init.NominalTimeSeg2      = nt2;
+    h->Init.DataPrescaler        = dp;
+    h->Init.DataSyncJumpWidth    = dsjw;
+    h->Init.DataTimeSeg1         = dt1;
+    h->Init.DataTimeSeg2         = dt2;
+    h->Init.Mode = listen_only ? FDCAN_MODE_BUS_MONITORING : FDCAN_MODE_NORMAL;
 
-    if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
+    if (HAL_FDCAN_Init(h) != HAL_OK)
     {
-        LOG_E("can1 init failed (nominal=%u data=%u)", nominal_bps, data_bps);
+        LOG_E("CAN%d init failed (nominal=%u data=%u)", bus + 1, nominal_bps, data_bps);
         return -RT_ERROR;
     }
 
-    if (can_config_filters(&hfdcan1) != RT_EOK)
+    if (can_config_filters(h) != RT_EOK)
     {
         return -RT_ERROR;
     }
 
-    if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK)
+    if (HAL_FDCAN_Start(h) != HAL_OK)
     {
-        LOG_E("can1 start failed");
+        LOG_E("CAN%d start failed", bus + 1);
         return -RT_ERROR;
     }
 
-    LOG_I("CAN1 timing: %u/%u bps (p=%u/%u t1=%u/%u t2=%u/%u)%s",
-          nominal_bps, data_bps, np, dp, nt1, dt1, nt2, dt2,
+    LOG_I("CAN%d timing: %u/%u bps (p=%u/%u t1=%u/%u t2=%u/%u)%s",
+          bus + 1, nominal_bps, data_bps, np, dp, nt1, dt1, nt2, dt2,
           listen_only ? " listen-only" : "");
 
     return RT_EOK;
 }
 
-rt_err_t can1_set_timing(uint32_t nominal_bps, uint32_t data_bps, rt_bool_t listen_only)
+rt_err_t can_bus_set_timing(int bus, uint32_t nominal_bps, uint32_t data_bps, rt_bool_t listen_only)
 {
     rt_err_t ret;
 
-    if (!can1_lock_ready) return -RT_ERROR;
+    if (bus < 0 || bus >= CAN_BUS_COUNT) return -RT_EINVAL;
+    if (!can_ctx[bus].lock_ready) return -RT_ERROR;
 
-    rt_mutex_take(&can1_lock, RT_WAITING_FOREVER);
-    ret = can1_apply(nominal_bps, data_bps, listen_only);
-    rt_mutex_release(&can1_lock);
+    rt_mutex_take(&can_ctx[bus].lock, RT_WAITING_FOREVER);
+    ret = can_bus_apply(bus, nominal_bps, data_bps, listen_only);
+    rt_mutex_release(&can_ctx[bus].lock);
 
     return ret;
 }
 
 /* ------------------------------------------------------------------ */
-/* CAN1 发送（SLCAN 使用）                                             */
+/* 发送                                                                */
 /* ------------------------------------------------------------------ */
 
-rt_err_t can1_send_user_msg(const can_user_msg_t *msg)
+rt_err_t can_bus_send(int bus, const can_user_msg_t *msg)
 {
+    FDCAN_HandleTypeDef *h;
     FDCAN_TxHeaderTypeDef tx;
     uint8_t dlc;
     HAL_StatusTypeDef st;
 
+    if (bus < 0 || bus >= CAN_BUS_COUNT) return -RT_EINVAL;
     if (msg == RT_NULL) return -RT_EINVAL;
     if (!msg->fd && msg->len > 8) return -RT_EINVAL;
 
     dlc = can_len_to_dlc(msg->len);
     if (dlc == 0xFF) return -RT_EINVAL;
+
+    h = can_handle[bus];
 
     tx.Identifier          = msg->id;
     tx.IdType              = msg->extended ? FDCAN_EXTENDED_ID : FDCAN_STANDARD_ID;
@@ -310,11 +327,11 @@ rt_err_t can1_send_user_msg(const can_user_msg_t *msg)
     tx.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
     tx.MessageMarker       = 0;
 
-    if (!can1_lock_ready) return -RT_ERROR;
+    if (!can_ctx[bus].lock_ready) return -RT_ERROR;
 
-    rt_mutex_take(&can1_lock, RT_WAITING_FOREVER);
-    st = HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &tx, (uint8_t *)msg->data);
-    rt_mutex_release(&can1_lock);
+    rt_mutex_take(&can_ctx[bus].lock, RT_WAITING_FOREVER);
+    st = HAL_FDCAN_AddMessageToTxFifoQ(h, &tx, (uint8_t *)msg->data);
+    rt_mutex_release(&can_ctx[bus].lock);
 
     return (st == HAL_OK) ? RT_EOK : -RT_EBUSY;
 }
@@ -323,11 +340,11 @@ rt_err_t can1_send_user_msg(const can_user_msg_t *msg)
 /* 接收                                                                */
 /* ------------------------------------------------------------------ */
 
-static void can_log_rx_frame(FDCAN_HandleTypeDef *hcan, const FDCAN_RxHeaderTypeDef *rxHeader,
+static void can_log_rx_frame(int bus, const FDCAN_RxHeaderTypeDef *rxHeader,
                              const uint8_t *rxData, uint8_t data_len)
 {
-    LOG_D("CAN FD RX: CAN%c ID=0x%08X LEN=%d BRS=%d FDF=%d",
-          (hcan == &hfdcan1 ? '1' : '2'), (unsigned)rxHeader->Identifier, data_len,
+    LOG_D("CAN FD RX: CAN%d ID=0x%08X LEN=%d BRS=%d FDF=%d",
+          bus + 1, (unsigned)rxHeader->Identifier, data_len,
           (rxHeader->BitRateSwitch == FDCAN_BRS_ON), (rxHeader->FDFormat == FDCAN_FD_CAN));
 
     if (data_len > 0)
@@ -364,8 +381,9 @@ static void can_log_rx_frame(FDCAN_HandleTypeDef *hcan, const FDCAN_RxHeaderType
     }
 }
 
-static void _can_poll_readmessage(FDCAN_HandleTypeDef *hcan)
+static void _can_poll_readmessage(int bus)
 {
+    FDCAN_HandleTypeDef *hcan = can_handle[bus];
     FDCAN_RxHeaderTypeDef rxHeader;
     uint8_t rxData[64];
 
@@ -378,9 +396,9 @@ static void _can_poll_readmessage(FDCAN_HandleTypeDef *hcan)
             HAL_StatusTypeDef st;
             rt_bool_t locked = RT_FALSE;
 
-            if (hcan == &hfdcan1 && can1_lock_ready)
+            if (can_ctx[bus].lock_ready)
             {
-                rt_mutex_take(&can1_lock, RT_WAITING_FOREVER);
+                rt_mutex_take(&can_ctx[bus].lock, RT_WAITING_FOREVER);
                 locked = RT_TRUE;
             }
 
@@ -388,7 +406,7 @@ static void _can_poll_readmessage(FDCAN_HandleTypeDef *hcan)
 
             if (locked)
             {
-                rt_mutex_release(&can1_lock);
+                rt_mutex_release(&can_ctx[bus].lock);
             }
 
             if (st == HAL_OK)
@@ -396,18 +414,18 @@ static void _can_poll_readmessage(FDCAN_HandleTypeDef *hcan)
                 uint8_t dlc_code = (uint8_t)((rxHeader.DataLength >> 16) & 0x0Fu);
                 uint8_t data_len = can_dlc_to_len(dlc_code);
 
-                if (hcan == &hfdcan1 && slcan_is_open())
+                if (slcan_is_open(bus))
                 {
-                    slcan_send_rx(&rxHeader, rxData, data_len);
+                    slcan_send_rx(bus, &rxHeader, rxData, data_len);
                 }
                 else
                 {
-                    can_log_rx_frame(hcan, &rxHeader, rxData, data_len);
+                    can_log_rx_frame(bus, &rxHeader, rxData, data_len);
                 }
             }
             else
             {
-                LOG_E("Failed to read message from FIFO0");
+                LOG_E("CAN%d: failed to read message from FIFO0", bus + 1);
             }
         }
         else
@@ -475,49 +493,22 @@ void can_init(void)
 
     can_gpio_init();
 
-    rt_mutex_init(&can1_lock, "can1", RT_IPC_FLAG_PRIO);
-    can1_lock_ready = RT_TRUE;
-
-    /* CAN1：SLCAN 通道 */
-    can1_hw_defaults();
-    if (can1_apply(CAN1_DEFAULT_NOMINAL_BPS, CAN1_DEFAULT_DATA_BPS, RT_FALSE) != RT_EOK)
-    {
-        LOG_E("can1 init failed");
-    }
-
-    /* FDCAN2 初始化（独立测试通道） */
+    hfdcan1.Instance = FDCAN1;
     hfdcan2.Instance = FDCAN2;
-    hfdcan2.Init.ClockDivider = FDCAN_CLOCK_DIV1;
-    hfdcan2.Init.FrameFormat = FDCAN_FRAME_FD_BRS;
-    hfdcan2.Init.Mode = FDCAN_MODE_NORMAL;
-    hfdcan2.Init.AutoRetransmission = ENABLE;
-    hfdcan2.Init.TransmitPause = ENABLE;
-    hfdcan2.Init.ProtocolException = DISABLE;
-    hfdcan2.Init.NominalPrescaler = 17;
-    hfdcan2.Init.NominalSyncJumpWidth = 4;
-    hfdcan2.Init.NominalTimeSeg1 = 15;
-    hfdcan2.Init.NominalTimeSeg2 = 4;
-    hfdcan2.Init.DataPrescaler = 5;
-    hfdcan2.Init.DataSyncJumpWidth = 2;
-    hfdcan2.Init.DataTimeSeg1 = 7;
-    hfdcan2.Init.DataTimeSeg2 = 2;
-    hfdcan2.Init.StdFiltersNbr = 28;
-    hfdcan2.Init.ExtFiltersNbr = 8;
-    hfdcan2.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
-    if (HAL_FDCAN_Init(&hfdcan2) != HAL_OK)
-    {
-        LOG_E("can2 init failed");
-    }
-    else
-    {
-        can_config_filters(&hfdcan2);
-    }
 
-    rt_thread_mdelay(10);
-
-    if (HAL_FDCAN_Start(&hfdcan2) != HAL_OK)
+    for (int bus = 0; bus < CAN_BUS_COUNT; bus++)
     {
-        LOG_E("can2 start failed");
+        char name[RT_NAME_MAX + 1];
+
+        rt_snprintf(name, sizeof(name), "can%d", bus + 1);
+        rt_mutex_init(&can_ctx[bus].lock, name, RT_IPC_FLAG_PRIO);
+        can_ctx[bus].lock_ready = RT_TRUE;
+
+        can_hw_defaults(can_handle[bus]);
+        if (can_bus_apply(bus, CAN_DEFAULT_NOMINAL_BPS, CAN_DEFAULT_DATA_BPS, RT_FALSE) != RT_EOK)
+        {
+            LOG_E("CAN%d init failed", bus + 1);
+        }
     }
 
     // create CAN1 & CAN2 receive threads (parameter 1 / 2)
@@ -531,11 +522,10 @@ void can_init(void)
 
 void can_rxthread_entry(void *parameter)
 {
-    uintptr_t sel = (uintptr_t)parameter; /* 1 => CAN1, 2 => CAN2 */
-    FDCAN_HandleTypeDef *h = (sel == 2) ? &hfdcan2 : &hfdcan1;
+    int bus = ((uintptr_t)parameter == 2) ? 1 : 0;
 
     while (1)
     {
-        _can_poll_readmessage(h);
+        _can_poll_readmessage(bus);
     }
 }

@@ -32,10 +32,10 @@ void can_tx_test_message(void);
 uint8_t can_dlc_to_len(uint8_t dlc_code);
 uint8_t can_len_to_dlc(uint8_t len);
 
-/* 在 CAN1 上发送一帧报文（SLCAN 通道） */
-rt_err_t can1_send_user_msg(const can_user_msg_t *msg);
+/* bus: 0 = CAN1，1 = CAN2；在两路上发送一帧报文（SLCAN 通道） */
+rt_err_t can_bus_send(int bus, const can_user_msg_t *msg);
 
-/* 重新配置 CAN1 的仲裁段/数据段速率，listen_only 为 RT_TRUE 时进入只听模式 */
-rt_err_t can1_set_timing(uint32_t nominal_bps, uint32_t data_bps, rt_bool_t listen_only);
+/* 重新配置指定总线的仲裁段/数据段速率，listen_only 为 RT_TRUE 时进入只听模式 */
+rt_err_t can_bus_set_timing(int bus, uint32_t nominal_bps, uint32_t data_bps, rt_bool_t listen_only);
 
 #endif /* APPLICATIONS_CAN_H_ */

@@ -71,6 +71,7 @@
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc://${ProjName}/applications}&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/applications/thread}&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/applications/can}&quot;"/>
+									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/applications/slcan}&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/applications/usb}&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc:/${ProjName}/packages/tinyusb-0.19.0/src}&quot;"/>
 									<listOptionValue builtIn="false" value="&quot;${workspace_loc://${ProjName}//.}&quot;"/>

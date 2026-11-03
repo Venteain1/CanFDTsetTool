@@ -13,9 +13,10 @@
 CanFDTsetTool 是一个自用的 CAN FD 工具固件：使用 STM32G474 的 FDCAN1 / FDCAN2 两路
 CAN FD 控制器收发报文，通过 USB 虚拟串口与 PC 通信。
 
-**FDCAN1 被实现为一个 SLCAN（LAWICEL ASCII）+ CAN FD 扩展设备**，可以直接用开源的
+**FDCAN1 / FDCAN2 各被实现为一个 SLCAN（LAWICEL ASCII）+ CAN FD 扩展设备**：插一个
+USB 口会出现三个 COM 口（CAN1 / CAN2 / 控制台），可以直接用开源的
 [CANgaroo](https://github.com/wikilift/CANgaroo)（Cangaroo 的活跃分支）在 Windows 上
-收发报文、DBC 解码、录制 trace，不需要自己写上位机。
+同时收发两路报文、DBC 解码、录制 trace，不需要自己写上位机。
 
 ### 当前已实现
 
@@ -24,14 +25,15 @@ CAN FD 控制器收发报文，通过 USB 虚拟串口与 PC 通信。
 - **只听模式**：`M1` 进入 FDCAN Bus Monitoring 模式，只监听不应答
 - 双路 CAN FD 初始化：FDCAN1（PD0/PD1）、FDCAN2（PB12/PB13），CAN FD + BRS，最高 64 字节
 - 标准帧 / 扩展帧全通滤波，接收走 RX FIFO0
-- 两路独立的接收线程；SLCAN 打开时 CAN1 的报文走 USB，否则按十六进制打印到控制台
+- 两路独立的接收线程；对应 SLCAN 通道打开时报文走 USB，否则按十六进制打印到控制台
 - MSH 命令 `can_tx64`：在 FDCAN2 上发送一帧 64 字节、ID = `0x123` 的 CAN FD+BRS 测试帧
-- USB 全速双 CDC 设备（TinyUSB）：CDC0 = SLCAN 数据通道，CDC1 = 控制台
-- 控制台双通道：优先 USB CDC1，未连接时自动回退到 UART1（PA9/PA10，115200 8N1）
+- USB 全速三路 CDC 设备（TinyUSB）：CDC0 = CAN1 SLCAN、CDC1 = CAN2 SLCAN、CDC2 = 控制台
+- 控制台双通道：优先 USB CDC2，未连接时自动回退到 UART1（PA9/PA10，115200 8N1）
 - 无堆（RT-Thread Nano）环境下的静态线程管理封装：固定线程表 + 静态栈
 
-> 说明：SLCAN 协议本身是单通道的，因此 CAN1 是 CANgaroo 使用的通道，CAN2 目前仅作为
-> 独立的测试/日志通道（`can_tx64`）。双通道同时接入上位机需要扩展私有协议，见文末计划。
+> 说明：SLCAN 是「一个串口对应一条总线」的协议，所以两路 CAN 各占一个 CDC 接口。
+> STM32G4 的 USB FS 只有 8 个端点，靠让每个 CDC 的 bulk IN/OUT 共用端点编号
+> （如 `0x02` / `0x82`）才放得下 3 路 CDC：6 个端点号 + EP0 = 7 个。
 
 ## 硬件平台
 
@@ -79,7 +81,7 @@ CanFDTsetTool/
 │   ├── main.c / main.h      # 入口、启动函数表 functions[]
 │   ├── can/                 # FDCAN1/FDCAN2 初始化、位时序计算、收发
 │   ├── slcan/               # SLCAN-FD 协议解析与 USB 收发（CANgaroo 通道）
-│   ├── usb/                 # USB PCD 初始化 + TinyUSB 双 CDC 设备
+│   ├── usb/                 # USB PCD 初始化 + TinyUSB 三路 CDC 设备
 │   └── thread/              # 无堆环境下的静态线程管理（创建/删除/改优先级）
 ├── drivers/                 # 板级驱动：时钟、串口/控制台、HAL 配置、中断
 ├── libraries/               # CMSIS + STM32G4xx HAL Driver
@@ -98,9 +100,9 @@ CanFDTsetTool/
 rt_hw_board_init()            // 时钟 170 MHz、串口初始化
 main()                        // RT-Thread 用户 main 线程
   └─ run_on_start()
-       ├─ can_init()           // FDCAN1（SLCAN 通道）+ FDCAN2 + 接收线程
-       ├─ usb_component_init() // HAL_PCD + TinyUSB 双 CDC + tud_task 线程
-       └─ slcan_init()         // SLCAN 命令解析线程
+       ├─ can_init()           // FDCAN1 / FDCAN2 + 两路接收线程
+       ├─ usb_component_init() // HAL_PCD + TinyUSB 三路 CDC + tud_task 线程
+       └─ slcan_init()         // 两路 SLCAN 命令解析线程
   └─ 主线程进入 1 s 空转循环
 ```
 
@@ -112,10 +114,11 @@ main()                        // RT-Thread 用户 main 线程
 | --- | --- | --- | --- |
 | `tshell` | 5 | 4096 | finsh/MSH 命令行 |
 | `main` | 10 | 2048 | 启动各组件后空转 |
-| `slcan` | 19 | 1536 | 解析 USB CDC0 上的 SLCAN 命令与待发送帧 |
+| `slcan1` | 19 | 1536 | 解析 CDC0 上的 SLCAN 命令（CAN1） |
+| `slcan2` | 19 | 1536 | 解析 CDC1 上的 SLCAN 命令（CAN2） |
 | `tusbt` | 20 | 2048 | USB 栈轮询（`tud_task()`，1 ms 周期） |
 | `can_rx1` | 20 | 1536 | FDCAN1 接收轮询（SLCAN 打开时转发到 USB） |
-| `can_rx2` | 20 | 1536 | FDCAN2 接收轮询（日志输出） |
+| `can_rx2` | 20 | 1536 | FDCAN2 接收轮询（SLCAN 打开时转发到 USB） |
 | `tidle` | 31 | 256 | 空闲线程 |
 
 受 `THREAD_MANAGER_MAX_COUNT` 限制，静态线程最多 8 个，单线程栈上限 2048 字节
@@ -128,13 +131,13 @@ main()                        // RT-Thread 用户 main 线程
 | 总线 | 仲裁段 | 数据段 | 说明 |
 | --- | --- | --- | --- |
 | CAN1（SLCAN） | 500 kbit/s | 2 Mbit/s | 默认值，可由上位机 `S`/`Y` 实时修改 |
-| CAN2（测试） | 500 kbit/s | 3.4 Mbit/s | 编译期固定（`can.c` 中 `hfdcan2.Init`） |
+| CAN2（SLCAN） | 500 kbit/s | 2 Mbit/s | 同上，两路参数互相独立 |
 
-CAN1 的位时序由 `fdcan_find_timing()` 根据 170 MHz 内核时钟自动计算：在预分频范围内
+两路的位时序都由 `fdcan_find_timing()` 根据 170 MHz 内核时钟自动计算：在预分频范围内
 枚举，取采样点约 80%、误差不超过 1% 的最优组合；改动速率时执行
-`Stop → Init → 配置滤波器 → Start`，并用互斥量避免与接收线程并发访问。
+`Stop → Init → 配置滤波器 → Start`，并用各自的互斥量避免与接收线程并发访问。
 
-> 3.4 Mbit/s 这类非标准数据段速率可以通过 `Y` + 6 位十六进制自定义（例如 `Y33E1C0`），
+> 非标准数据段速率（例如 3.4 Mbit/s）可以用 `Y` + 6 位十六进制自定义，
 > 但需要收发器和线束支持；CANgaroo 的预设档位为 1/2/3/4/5 Mbit/s。
 
 ### 滤波器与模式
@@ -154,9 +157,9 @@ CANgaroo 的 SLCAN 驱动按 VID/PID 枚举设备，本项目采用其可识别�
 | --- | --- |
 | VID:PID | `0x0483:0x5740`（STM32 虚拟串口，Windows 自带驱动） |
 | 序列号 | `AAA00001`（`AAA` 前缀是 CANgaroo 的识别条件） |
-| CDC0 | SLCAN 数据通道（CAN1） |
-| CDC1 | finsh 控制台（日志/命令） |
-| 端点 | CDC0 notif `0x81`、OUT `0x02`、IN `0x83`；CDC1 notif `0x84`、OUT `0x05`、IN `0x86` |
+| CDC0 | SLCAN 数据通道（CAN1）：notif `0x81`、OUT `0x02` / IN `0x82` |
+| CDC1 | SLCAN 数据通道（CAN2）：notif `0x83`、OUT `0x04` / IN `0x84` |
+| CDC2 | finsh 控制台（日志/命令）：notif `0x85`、OUT `0x06` / IN `0x86` |
 
 > 换成这组 VID/PID 只是为了让现成上位机认得这台自定义设备；如果以后要公开发布，
 > 建议改为在 CANgaroo 的 `SLCANDriver::update()` 中登记自己的 VID/PID。
@@ -165,7 +168,7 @@ CANgaroo 的 SLCAN 驱动按 VID/PID 枚举设备，本项目采用其可识别�
 
 | 命令 | 说明 | 应答 |
 | --- | --- | --- |
-| `C` | 关闭通道（CAN1 恢复本地日志） | `\r` |
+| `C` | 关闭通道（该路恢复本地日志） | `\r` |
 | `O` | 打开通道 | `\r` |
 | `V` | 版本号 | `V1013\r` |
 | `S<x>` | 仲裁段速率：单字符预设，或 6 位十六进制 | `\r` / `\a` |
@@ -184,12 +187,14 @@ S7=800k, S8=1M, S9=83.333k, SA=75k, SB=62.5k, SC=33.333k, SD=5k`；
 
 1. 从 [CANgaroo Releases](https://github.com/wikilift/CANgaroo/releases/tag/CANgaroo) 下载
    `cangaroo-0.3.1_WIN.zip` 并解压运行；
-2. 设备插入后枚举为 USB 串口（COMx），首次会自动安装 `usbser.sys`；
-3. 双 CDC 会生成**两个 COM 口**：编号较小的通常是 CDC0（SLCAN 数据口），另一个是 CDC1 控制台
-   （用任意串口终端打开它能看到启动日志，可据此确认）；
-4. CANgaroo 中选择 `SLCAN` 接口 → 选中 CDC0 对应的 COM 口（显示为 WeAct USB2CAN 属正常）→
-   设置仲裁段/数据段速率 → 开始测量；
-5. CAN1 接上收发器和总线，即可在 Trace 窗口看到报文、用 DBC 解码，并通过发送窗口发帧。
+2. 设备插入后会枚举出**三个 COM 口**（首次自动安装 `usbser.sys`），分别对应
+   CDC0（CAN1）、CDC1（CAN2）、CDC2（控制台）；编号顺序一般与接口顺序一致，
+   用串口终端打开控制台那个口能看到启动日志，可据此确认；
+3. CANgaroo 中依次添加两个 `SLCAN` 接口，分别选中 CAN1、CAN2 对应的 COM 口
+   （显示为 WeAct USB2CAN 属正常），并各自设置仲裁段/数据段速率；
+4. 在 Measurement Setup 中把它们分到两个 network（如 CAN1、CAN2），开始测量即可同屏抓两路；
+5. CAN1 / CAN2 分别接上收发器和总线，就能在 Trace 窗口看报文、用 DBC 解码、通过发送窗口发帧。
+6. **注意**：控制台那个 COM 口不要加进 CANgaroo，否则会被当成 SLCAN 接口。
 
 ## 构建与烧录
 
@@ -197,8 +202,8 @@ S7=800k, S8=1M, S9=83.333k, SA=75k, SB=62.5k, SC=33.333k, SD=5k`；
 
 1. `File → Import → RT-Thread Studio Project`，选择本仓库根目录；
 2. 目标配置选择 `Debug`；
-3. 由于新增了 `applications/slcan/` 目录，导入后先按 `F5` 刷新工程，再执行
-   `Clean` + `Build`，让 Studio 重新生成 `Debug/**/subdir.mk`；
+3. `applications/slcan/` 的 include 路径已写入 `.cproject`；导入后仍建议按 `F5` 刷新工程，
+   再执行 `Clean` + `Build`，让 Studio 重新生成 `Debug/**/subdir.mk` 并纳入 `slcan.c`；
 4. 产物：`Debug/rtthread.elf`、`Debug/rtthread.bin`；
 5. 通过 ST-Link / J-Link 的 SWD 接口下载。
 
@@ -219,7 +224,7 @@ make -j
 
 ## 控制台与命令
 
-控制台输出优先使用 USB CDC1（需要主机打开串口并置位 DTR），否则回退到 UART1
+控制台输出优先使用 USB CDC2（需要主机打开串口并置位 DTR），否则回退到 UART1
 （PA9/PA10，115200 8N1）。可用命令：
 
 | 命令 | 说明 |
@@ -243,9 +248,9 @@ CAN FD RX: CAN1 ID=0x00000123 LEN=64 BRS=1 FDF=1
 | --- | --- |
 | `applications/main.c` / `main.h` | 程序入口，`functions[]` 启动函数表 |
 | `applications/can/can.c` | FDCAN 初始化、位时序计算、滤波器、接收线程、SLCAN 发送接口 |
-| `applications/slcan/slcan.c` | SLCAN-FD 命令/帧解析、CDC0 收发、打开状态管理 |
+| `applications/slcan/slcan.c` | 双通道 SLCAN-FD 命令/帧解析、CDC0/CDC1 收发、各路独立状态 |
 | `applications/usb/usb.c` | USB 时钟（HSI48）、`HAL_PCD` 初始化与启动 |
-| `applications/usb/usb_tiny_cdc.c` | TinyUSB 描述符、双 CDC 读写、DTR 状态、`tud_task` 线程、USB 中断 |
+| `applications/usb/usb_tiny_cdc.c` | TinyUSB 描述符、三路 CDC 读写、DTR 状态、`tud_task` 线程、USB 中断 |
 | `applications/thread/util_thread.c` | 静态线程表管理（`create_thread_param`、`find_thread`、`delete_thread` 等） |
 | `drivers/drv_usart.c` | UART1 + USB CDC 控制台的输出/输入切换实现 |
 | `drivers/drv_clk.c` | 系统时钟配置（170 MHz） |
@@ -253,13 +258,12 @@ CAN FD RX: CAN1 ID=0x00000123 LEN=64 BRS=1 FDF=1
 
 ## 已知限制与后续计划
 
-- [x] 上位机可用的 SLCAN-FD 通道（CAN1）+ 运行时波特率配置
-- [ ] **仅单通道 SLCAN**：CAN2 无法同时被 CANgaroo 使用；如需双通道，可在 `S`/`Y` 之外扩展私有命令，或改用 GVRET 双端口协议
+- [x] 两路 SLCAN-FD 通道（CAN1 / CAN2）+ 每路独立的运行时波特率配置
+- [ ] 三路 CDC 共享 12 Mbit/s 全速带宽，两路高负载 FD 抓包时可能丢帧
+- [ ] 控制台口也会出现在 CANgaroo 的 SLCAN 接口列表里，添加接口时要避开
 - [ ] 未实现 SLCAN 的 `Z`（时间戳）等可选命令，时间戳由上位机接收时刻生成
 - [ ] 未上报 CAN 错误帧 / Bus-Off 状态，也没有错误计数器
 - [ ] 发送采用「入队即应答」，总线错误不会反馈给上位机
-- [ ] CAN2 的数据段速率（3.4 Mbit/s）为编译期固定值，需按实际硬件能力调整
-- [ ] `applications/can/can.c` 中 CAN2 仍使用固定时序，未接入自动计算
 - [ ] 缺少单元测试与 CI
 
 ## 许可证

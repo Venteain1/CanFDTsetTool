@@ -18,8 +18,9 @@ extern "C" {
 #define CFG_TUD_ENABLED             1
 #define CFG_TUD_ENDPOINT0_SIZE      64
 
-/* 启用两个 CDC 实例：CDC0 普通数据，CDC1 作为控制台 */
-#define CFG_TUD_CDC                 2
+/* 启用三个 CDC 实例：CDC0=CAN1 数据，CDC1=CAN2 数据，CDC2 作为控制台
+ * （每个 CDC 的 bulk IN/OUT 共用端点编号，才能放进 8 个端点内） */
+#define CFG_TUD_CDC                 3
 #define CFG_TUD_MSC                 0
 #define CFG_TUD_HID                 0
 #define CFG_TUD_VENDOR              0

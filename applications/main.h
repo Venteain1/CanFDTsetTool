@@ -13,6 +13,7 @@
 #include <rtthread.h>
 #include "can.h"
 #include "usb.h"
+#include "slcan.h"
 #include "util_thread.h"
 
 typedef void (*start_func_t)(void);
@@ -20,6 +21,7 @@ typedef void (*start_func_t)(void);
 static start_func_t functions[] = {
     can_init,
     usb_component_init,
+    slcan_init,
     NULL
 };
 #endif /* APPLICATIONS_MAIN_H_ */

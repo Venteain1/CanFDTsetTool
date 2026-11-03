@@ -8,9 +8,13 @@
 #include <rtdbg.h>
 #define USB_LOG LOG_D
 
-/* 描述符实现: 设备 + 配置 + 字符串 (双 CDC: CDC0 数据接口 + CDC1 控制台) */
-#define USB_VID 0x16C0
-#define USB_PID 0x05DC
+/* 描述符实现: 设备 + 配置 + 字符串 (双 CDC: CDC0 数据接口 + CDC1 控制台)
+ *
+ * VID/PID 使用 STM32 虚拟串口 (0483:5740)，序列号以 "AAA" 开头，
+ * 这样 CANgaroo 的 SLCAN 驱动会把它识别成支持 CAN FD + 自定义速率的
+ * WeAct USB2CAN 设备（见 CANgaroo SLCANDriver 的厂商匹配逻辑）。 */
+#define USB_VID 0x0483
+#define USB_PID 0x5740
 
 /* 设备描述符 */
 uint8_t const desc_device[] = {
@@ -60,7 +64,7 @@ uint8_t const desc_configuration[] = {
 };
 
 /* 字符串表 */
-static char serial_str[16] = "12345678"; /* 可动态生成 */
+static char serial_str[16] = "AAA00001"; /* "AAA" 前缀用于 CANgaroo 识别 */
 
 char const *string_desc_arr[] = {
     NULL,              /* 0: Language ID handled separately */
@@ -143,6 +147,44 @@ int tinyusb_cdc_write(const uint8_t *data, rt_size_t len)
     uint32_t w = tud_cdc_write(data, (uint32_t)len);
     tud_cdc_write_flush();
     return (int)w;
+}
+
+/* SLCAN 数据通道：不依赖 DTR，只要 USB 已连接就写 */
+int tinyusb_cdc_write_force(const uint8_t *data, rt_size_t len)
+{
+    uint32_t w;
+
+    if (!data || len == 0) return 0;
+    if (!tud_cdc_n_connected(0)) return 0;
+
+    w = tud_cdc_n_write(0, data, (uint32_t)len);
+    if (w > 0) tud_cdc_n_write_flush(0);
+
+    return (int)w;
+}
+
+int tinyusb_cdc_read(uint8_t *data, rt_size_t len)
+{
+    uint32_t avail;
+
+    if (!data || len == 0) return 0;
+    if (!tud_cdc_n_connected(0)) return 0;
+
+    avail = tud_cdc_n_available(0);
+    if (avail == 0) return 0;
+    if (len > avail) len = avail;
+
+    return (int)tud_cdc_n_read(0, data, (uint32_t)len);
+}
+
+void tinyusb_cdc_flush_input(void)
+{
+    tud_cdc_n_read_flush(0);
+}
+
+bool tinyusb_cdc_connected(void)
+{
+    return tud_cdc_n_connected(0);
 }
 
 int tinyusb_cdc_console_write(const uint8_t *data, rt_size_t len)

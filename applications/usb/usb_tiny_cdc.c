@@ -70,19 +70,22 @@ enum {
 
 uint8_t const desc_configuration[] = {
         TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x80, 50),
-        TUD_CDC_DESCRIPTOR(ITF_NUM_CDC0, 0, EPNUM_CDC0_NOTIF, 8, EPNUM_CDC0_OUT, EPNUM_CDC0_IN, 64),
-        TUD_CDC_DESCRIPTOR(ITF_NUM_CDC1, 0, EPNUM_CDC1_NOTIF, 8, EPNUM_CDC1_OUT, EPNUM_CDC1_IN, 64),
-        TUD_CDC_DESCRIPTOR(ITF_NUM_CDC2, 0, EPNUM_CDC2_NOTIF, 8, EPNUM_CDC2_OUT, EPNUM_CDC2_IN, 64)
+        TUD_CDC_DESCRIPTOR(ITF_NUM_CDC0, 4, EPNUM_CDC0_NOTIF, 8, EPNUM_CDC0_OUT, EPNUM_CDC0_IN, 64),
+        TUD_CDC_DESCRIPTOR(ITF_NUM_CDC1, 5, EPNUM_CDC1_NOTIF, 8, EPNUM_CDC1_OUT, EPNUM_CDC1_IN, 64),
+        TUD_CDC_DESCRIPTOR(ITF_NUM_CDC2, 6, EPNUM_CDC2_NOTIF, 8, EPNUM_CDC2_OUT, EPNUM_CDC2_IN, 64)
 };
 
 /* 字符串表 */
 static char serial_str[16] = "AAA00001"; /* "AAA" 前缀用于 CANgaroo 识别 */
 
 char const *string_desc_arr[] = {
-    NULL,              /* 0: Language ID handled separately */
-    "CANFD Bridge",    /* 1: Manufacturer */
-    "CANFD CDC",       /* 2: Product */
-    serial_str          /* 3: Serial */
+    NULL,                /* 0: Language ID handled separately */
+    "CanFDTsetTool",     /* 1: Manufacturer */
+    "USB2CAN FD",        /* 2: Product */
+    serial_str,          /* 3: Serial */
+    "CAN1 (SLCAN)",      /* 4: CDC0 接口名 */
+    "CAN2 (SLCAN)",      /* 5: CDC1 接口名 */
+    "Console (finsh)"    /* 6: CDC2 接口名 */
 };
 
 static uint16_t _desc_str[32];

@@ -11,6 +11,7 @@
  */
 #ifndef APPLICATIONS_CAN_H_
 #define APPLICATIONS_CAN_H_
+#include <stdint.h>
 #include <rtthread.h>
 #include <stdio.h>
 

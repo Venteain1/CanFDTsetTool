@@ -72,7 +72,7 @@ USB 口会出现三个 COM 口（CAN1 / CAN2 / 控制台），可以直接用开
 | STM32G4 HAL | 来自 STM32Cube FW_G4 V1.6.1（`libraries/STM32G4xx_HAL_Driver`） |
 | TinyUSB | 0.19.0（`packages/tinyusb-0.19.0`），STM32 FSDEV 端口，`OPT_OS_NONE` |
 | 上位机 | CANgaroo 0.3.1（SLCAN 驱动，支持 CAN FD） |
-| 工具链 | arm-none-eabi-gcc（RT-Thread Studio 内置 5.4.1），`-mcpu=cortex-m4 -mfloat-abi=hard -mfpu=fpv4-sp-d16` |
+| 工具链 | Arm GNU Toolchain 14.3.1（aarch64-linux 宿主），`-mcpu=cortex-m4 -mfloat-abi=hard -mfpu=fpv4-sp-d16` |
 | 构建方式 | RT-Thread Studio 工程（`.project` / `.cproject`），构建目录 `Debug/` |
 
 ### 目录结构
@@ -217,6 +217,13 @@ S7=800k, S8=1M, S9=83.333k, SA=75k, SB=62.5k, SC=33.333k, SD=5k`；
 cd Debug
 make -j
 ```
+
+**Linux（aarch64 宿主）备注**
+
+本机使用 `~/Tool/arm-gnu-toolchain-14.3.rel1-aarch64-arm-none-eabi`，其 `gdb` 可直接在
+Debian 12 上运行；旧的 11.2-2022.02 版本依赖 `libncurses.so.5` 与 `libpython3.6m`，
+在新系统上会启动失败（表现为 RT-Thread Studio 报「获取 gdb 版本失败」）。
+Studio 中把 GCC 路径指向新工具链的 `bin/arm-none-eabi-gcc` 即可。
 
 **方式三：scons**
 

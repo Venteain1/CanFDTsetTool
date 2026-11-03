@@ -7,7 +7,11 @@
  * Date           Author       Notes
  * 2025-03-05     BZH1WX       the first version
  * 2025-11-03     Venteain     增加 SLCAN 双通道与运行时波特率配置
+ * 2025-11-03     Venteain     接收改为中断驱动 + 环形队列，增加丢帧统计
  */
+
+#include <string.h>
+#include <rthw.h>
 
 #include "stm32g4xx_hal.h"
 #include "util_thread.h"
@@ -32,6 +36,9 @@
 
 #define CAN_BUS_COUNT              2
 
+/* 每路接收队列深度：64 帧，约 4.8 KB/路 */
+#define CAN_RX_QUEUE_LEN           64
+
 void can_rxthread_entry(void *parameter);
 FDCAN_HandleTypeDef hfdcan1;
 FDCAN_HandleTypeDef hfdcan2;
@@ -40,8 +47,18 @@ static FDCAN_HandleTypeDef *const can_handle[CAN_BUS_COUNT] = { &hfdcan1, &hfdca
 
 typedef struct
 {
-    struct rt_mutex lock;
-    rt_bool_t       lock_ready;
+    struct rt_mutex     lock;
+    rt_bool_t           lock_ready;
+
+    struct rt_semaphore rx_sem;             /* RX 中断唤醒接收线程 */
+    can_rx_frame_t      queue[CAN_RX_QUEUE_LEN];
+    volatile uint16_t   head;
+    volatile uint16_t   tail;
+
+    volatile uint32_t   rx_frames;
+    volatile uint32_t   tx_frames;
+    volatile uint32_t   queue_drop;
+    volatile uint32_t   hw_lost;
 } can_bus_ctx_t;
 
 static can_bus_ctx_t can_ctx[CAN_BUS_COUNT];
@@ -72,6 +89,45 @@ uint8_t can_len_to_dlc(uint8_t len)
     case 64: return 15;
     default: return 0xFF;
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* 接收队列（单生产者：RX 线程；单消费者：SLCAN 线程）                 */
+/* ------------------------------------------------------------------ */
+
+static rt_bool_t can_queue_push(can_bus_ctx_t *ctx, const can_rx_frame_t *frame)
+{
+    uint16_t next = (uint16_t)((ctx->head + 1u) % CAN_RX_QUEUE_LEN);
+
+    if (next == ctx->tail) return RT_FALSE;
+
+    ctx->queue[ctx->head] = *frame;
+    ctx->head = next;
+    return RT_TRUE;
+}
+
+int can_bus_pop_rx(int bus, can_rx_frame_t *frame)
+{
+    can_bus_ctx_t *ctx;
+
+    if (bus < 0 || bus >= CAN_BUS_COUNT || frame == RT_NULL) return 0;
+
+    ctx = &can_ctx[bus];
+    if (ctx->tail == ctx->head) return 0;
+
+    *frame = ctx->queue[ctx->tail];
+    ctx->tail = (uint16_t)((ctx->tail + 1u) % CAN_RX_QUEUE_LEN);
+    return 1;
+}
+
+void can_bus_get_stats(int bus, can_bus_stats_t *stats)
+{
+    if (bus < 0 || bus >= CAN_BUS_COUNT || stats == RT_NULL) return;
+
+    stats->rx_frames  = can_ctx[bus].rx_frames;
+    stats->tx_frames  = can_ctx[bus].tx_frames;
+    stats->queue_drop = can_ctx[bus].queue_drop;
+    stats->hw_lost    = can_ctx[bus].hw_lost;
 }
 
 /* ------------------------------------------------------------------ */
@@ -226,6 +282,17 @@ static rt_err_t can_config_filters(FDCAN_HandleTypeDef *hcan)
     return RT_EOK;
 }
 
+/* 使能 RX FIFO0 新消息中断（每帧到达即唤醒接收线程） */
+static void can_enable_rx_irq(int bus, FDCAN_HandleTypeDef *h)
+{
+    IRQn_Type irq = (bus == 0) ? FDCAN1_IT0_IRQn : FDCAN2_IT0_IRQn;
+
+    (void)HAL_FDCAN_ActivateNotification(h, FDCAN_IT_RX_FIFO0_NEW_MESSAGE, FDCAN_INTERRUPT_LINE0);
+
+    HAL_NVIC_SetPriority(irq, 6, 0);
+    HAL_NVIC_EnableIRQ(irq);
+}
+
 /* 应用新的位时序（调用者需保证不并发访问该总线） */
 static rt_err_t can_bus_apply(int bus, uint32_t nominal_bps, uint32_t data_bps, rt_bool_t listen_only)
 {
@@ -275,6 +342,8 @@ static rt_err_t can_bus_apply(int bus, uint32_t nominal_bps, uint32_t data_bps, 
         LOG_E("CAN%d start failed", bus + 1);
         return -RT_ERROR;
     }
+
+    can_enable_rx_irq(bus, h);
 
     LOG_I("CAN%d timing: %u/%u bps (p=%u/%u t1=%u/%u t2=%u/%u)%s",
           bus + 1, nominal_bps, data_bps, np, dp, nt1, dt1, nt2, dt2,
@@ -331,6 +400,7 @@ rt_err_t can_bus_send(int bus, const can_user_msg_t *msg)
 
     rt_mutex_take(&can_ctx[bus].lock, RT_WAITING_FOREVER);
     st = HAL_FDCAN_AddMessageToTxFifoQ(h, &tx, (uint8_t *)msg->data);
+    if (st == HAL_OK) can_ctx[bus].tx_frames++;
     rt_mutex_release(&can_ctx[bus].lock);
 
     return (st == HAL_OK) ? RT_EOK : -RT_EBUSY;
@@ -381,60 +451,84 @@ static void can_log_rx_frame(int bus, const FDCAN_RxHeaderTypeDef *rxHeader,
     }
 }
 
-static void _can_poll_readmessage(int bus)
+/* 尽可能快地把控制器 FIFO 里的帧搬进软件队列，绝不在 USB 上阻塞 */
+static void can_drain_rx(int bus)
 {
+    can_bus_ctx_t *ctx = &can_ctx[bus];
     FDCAN_HandleTypeDef *hcan = can_handle[bus];
-    FDCAN_RxHeaderTypeDef rxHeader;
-    uint8_t rxData[64];
+    FDCAN_RxHeaderTypeDef header;
+    uint8_t data[64];
 
-    while (1)
+    /* RF0L 是“消息丢失”粘滞标志：观察到就说明上一轮之后有帧被硬件丢弃。
+     * 该位写 1 清除，避免同一次丢帧被反复计数。 */
+    if ((hcan->Instance->RXF0S & FDCAN_RXF0S_RF0L) != 0u)
     {
-        uint32_t msg_count = HAL_FDCAN_GetRxFifoFillLevel(hcan, FDCAN_RX_FIFO0);
+        ctx->hw_lost++;
+        hcan->Instance->RXF0S = FDCAN_RXF0S_RF0L;
+    }
 
-        if (msg_count > 0)
+    while (HAL_FDCAN_GetRxFifoFillLevel(hcan, FDCAN_RX_FIFO0) > 0u)
+    {
+        uint8_t dlc_code;
+        uint8_t len;
+
+        if (HAL_FDCAN_GetRxMessage(hcan, FDCAN_RX_FIFO0, &header, data) != HAL_OK)
         {
-            HAL_StatusTypeDef st;
-            rt_bool_t locked = RT_FALSE;
+            break;
+        }
 
-            if (can_ctx[bus].lock_ready)
+        ctx->rx_frames++;
+
+        dlc_code = (uint8_t)((header.DataLength >> 16) & 0x0Fu);
+        len = can_dlc_to_len(dlc_code);
+
+        if (slcan_is_open(bus))
+        {
+            can_rx_frame_t frame;
+
+            frame.id       = header.Identifier;
+            frame.len      = len;
+            frame.extended = (header.IdType == FDCAN_EXTENDED_ID) ? 1 : 0;
+            frame.remote   = (header.RxFrameType == FDCAN_REMOTE_FRAME) ? 1 : 0;
+            frame.fd       = (header.FDFormat == FDCAN_FD_CAN) ? 1 : 0;
+            frame.brs      = (header.BitRateSwitch == FDCAN_BRS_ON) ? 1 : 0;
+            memcpy(frame.data, data, len);
+
+            if (!can_queue_push(ctx, &frame))
             {
-                rt_mutex_take(&can_ctx[bus].lock, RT_WAITING_FOREVER);
-                locked = RT_TRUE;
-            }
-
-            st = HAL_FDCAN_GetRxMessage(hcan, FDCAN_RX_FIFO0, &rxHeader, rxData);
-
-            if (locked)
-            {
-                rt_mutex_release(&can_ctx[bus].lock);
-            }
-
-            if (st == HAL_OK)
-            {
-                uint8_t dlc_code = (uint8_t)((rxHeader.DataLength >> 16) & 0x0Fu);
-                uint8_t data_len = can_dlc_to_len(dlc_code);
-
-                if (slcan_is_open(bus))
-                {
-                    slcan_send_rx(bus, &rxHeader, rxData, data_len);
-                }
-                else
-                {
-                    can_log_rx_frame(bus, &rxHeader, rxData, data_len);
-                }
-            }
-            else
-            {
-                LOG_E("CAN%d: failed to read message from FIFO0", bus + 1);
+                ctx->queue_drop++;
             }
         }
         else
         {
-            rt_thread_mdelay(5);
+            can_log_rx_frame(bus, &header, data, len);
         }
-
-        rt_thread_yield();
     }
+}
+
+/* HAL 在 RX FIFO0 有新消息时回调（中断上下文） */
+void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
+{
+    int bus;
+
+    if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) == 0u) return;
+
+    bus = (hfdcan == &hfdcan2) ? 1 : 0;
+    rt_sem_release(&can_ctx[bus].rx_sem);
+}
+
+void FDCAN1_IT0_IRQHandler(void)
+{
+    rt_interrupt_enter();
+    HAL_FDCAN_IRQHandler(&hfdcan1);
+    rt_interrupt_leave();
+}
+
+void FDCAN2_IT0_IRQHandler(void)
+{
+    rt_interrupt_enter();
+    HAL_FDCAN_IRQHandler(&hfdcan2);
+    rt_interrupt_leave();
 }
 
 /* ------------------------------------------------------------------ */
@@ -501,8 +595,13 @@ void can_init(void)
         char name[RT_NAME_MAX + 1];
 
         rt_snprintf(name, sizeof(name), "can%d", bus + 1);
+
         rt_mutex_init(&can_ctx[bus].lock, name, RT_IPC_FLAG_PRIO);
         can_ctx[bus].lock_ready = RT_TRUE;
+
+        rt_sem_init(&can_ctx[bus].rx_sem, name, 0, RT_IPC_FLAG_PRIO);
+        can_ctx[bus].head = 0;
+        can_ctx[bus].tail = 0;
 
         can_hw_defaults(can_handle[bus]);
         if (can_bus_apply(bus, CAN_DEFAULT_NOMINAL_BPS, CAN_DEFAULT_DATA_BPS, RT_FALSE) != RT_EOK)
@@ -512,20 +611,23 @@ void can_init(void)
     }
 
     // create CAN1 & CAN2 receive threads (parameter 1 / 2)
-    if (create_thread_param(can_rxthread_entry, (void *)1, CAN_RX_THREAD_BASE_NAME "1", 1536, 20, 10) != RT_EOK)
+    if (create_thread_param(can_rxthread_entry, (void *)1, CAN_RX_THREAD_BASE_NAME "1", 1536, 18, 10) != RT_EOK)
         LOG_E("create can1 rx thread failed");
-    if (create_thread_param(can_rxthread_entry, (void *)2, CAN_RX_THREAD_BASE_NAME "2", 1536, 20, 10) != RT_EOK)
+    if (create_thread_param(can_rxthread_entry, (void *)2, CAN_RX_THREAD_BASE_NAME "2", 1536, 18, 10) != RT_EOK)
         LOG_E("create can2 rx thread failed");
 
-    LOG_I("CAN bus init done");
+    LOG_I("CAN bus init done (interrupt driven RX)");
 }
 
 void can_rxthread_entry(void *parameter)
 {
     int bus = ((uintptr_t)parameter == 2) ? 1 : 0;
+    can_bus_ctx_t *ctx = &can_ctx[bus];
 
     while (1)
     {
-        _can_poll_readmessage(bus);
+        /* 正常情况下由 RX FIFO0 中断唤醒；超时再兜底轮询一次 */
+        rt_sem_take(&ctx->rx_sem, rt_tick_from_millisecond(50));
+        can_drain_rx(bus);
     }
 }

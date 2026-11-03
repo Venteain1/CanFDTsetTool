@@ -24,6 +24,11 @@ int  tinyusb_cdc_n_write(uint8_t itf, const uint8_t *data, rt_size_t len);
 int  tinyusb_cdc_n_read(uint8_t itf, uint8_t *data, rt_size_t len);
 void tinyusb_cdc_n_flush(uint8_t itf);
 
+/* 批量发送：先 write_raw 多次，再统一 flush */
+int  tinyusb_cdc_n_write_raw(uint8_t itf, const uint8_t *data, rt_size_t len);
+void tinyusb_cdc_n_flush_tx(uint8_t itf);
+uint32_t tinyusb_cdc_n_write_available(uint8_t itf);
+
 /* CDC0 便捷封装 */
 bool tinyusb_cdc_connected(void);
 int  tinyusb_cdc_write_force(const uint8_t *data, rt_size_t len);

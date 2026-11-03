@@ -10,6 +10,9 @@
  *   CDC1（itf 1） <-> CAN2
  * 每个端口有独立的打开状态、波特率和命令解析，上位机看到的是两个 SLCAN 设备。
  *
+ * 接收路径：CAN 中断 -> 接收线程把帧搬进环形队列 -> 本文件线程批量编码成
+ * SLCAN 文本后写 USB，因此 USB 拥塞不会阻塞 CAN 接收。
+ *
  * 支持的帧格式（与 CANgaroo SLCANDriver 一致）：
  *   t/T  标准/扩展经典数据帧
  *   r/R  标准/扩展远程帧
@@ -37,6 +40,7 @@
 #define DBG_TAG "SLCAN"
 #define DBG_LVL DBG_INFO
 #include <rtdbg.h>
+#include <finsh.h>
 
 #define SLCAN_THREAD_STACK      1536
 #define SLCAN_THREAD_PRIORITY   19
@@ -44,6 +48,7 @@
 #define SLCAN_LINE_MAX          160
 
 #define SLCAN_PORT_COUNT        2
+#define SLCAN_TX_BATCH          16
 
 typedef struct
 {
@@ -59,6 +64,9 @@ typedef struct
 
     uint32_t    nominal_bps;
     uint32_t    data_bps;
+
+    volatile uint32_t tx_frames;
+    volatile uint32_t tx_drop;
 } slcan_port_t;
 
 static slcan_port_t s_ports[SLCAN_PORT_COUNT] =
@@ -80,8 +88,22 @@ rt_bool_t slcan_is_open(int bus)
     return (port != RT_NULL) && port->open;
 }
 
+uint32_t slcan_tx_drop(int bus)
+{
+    slcan_port_t *port = slcan_port_of_bus(bus);
+
+    return (port != RT_NULL) ? port->tx_drop : 0u;
+}
+
+uint32_t slcan_tx_count(int bus)
+{
+    slcan_port_t *port = slcan_port_of_bus(bus);
+
+    return (port != RT_NULL) ? port->tx_frames : 0u;
+}
+
 /* ------------------------------------------------------------------ */
-/* 输出                                                                */
+/* 输出：命令应答（小数据，允许短暂等待）                               */
 /* ------------------------------------------------------------------ */
 
 static void slcan_write(slcan_port_t *port, const void *data, rt_size_t len)
@@ -121,6 +143,69 @@ static void slcan_reply_err(slcan_port_t *port)
 static void slcan_reply_version(slcan_port_t *port)
 {
     slcan_write(port, "V1013\r", 6);
+}
+
+/* ------------------------------------------------------------------ */
+/* 输出：CAN 帧（批量、非阻塞，写不下就整帧丢弃并计数）                 */
+/* ------------------------------------------------------------------ */
+
+static int slcan_write_frame(slcan_port_t *port, const can_rx_frame_t *frame)
+{
+    char buf[SLCAN_LINE_MAX];
+    char type;
+    int dlc;
+    int n = 0;
+
+    dlc = (int)can_len_to_dlc(frame->len);
+    if (dlc == 0xFF) return 0;
+
+    if (frame->remote)   type = frame->extended ? 'R' : 'r';
+    else if (frame->fd)  type = frame->brs ? (frame->extended ? 'B' : 'b')
+                                           : (frame->extended ? 'D' : 'd');
+    else                 type = frame->extended ? 'T' : 't';
+
+    buf[n++] = type;
+    n += rt_snprintf(&buf[n], sizeof(buf) - n, frame->extended ? "%08X" : "%03X", (unsigned)frame->id);
+    n += rt_snprintf(&buf[n], sizeof(buf) - n, "%X", (unsigned)dlc);
+
+    for (int i = 0; i < frame->len && n < (int)sizeof(buf) - 3; i++)
+    {
+        uint8_t byte = frame->remote ? 0u : frame->data[i]; /* 远程帧补 0 保持格式完整 */
+        n += rt_snprintf(&buf[n], sizeof(buf) - n, "%02X", byte);
+    }
+    buf[n++] = '\r';
+
+    if (!tinyusb_cdc_n_connected(port->itf)) return 0;
+
+    /* 保证整帧能一次性放进 CDC 缓冲，避免出现半行导致主机解析错位 */
+    if (tinyusb_cdc_n_write_available(port->itf) < (uint32_t)n)
+    {
+        tinyusb_cdc_n_flush_tx(port->itf);
+        if (tinyusb_cdc_n_write_available(port->itf) < (uint32_t)n) return 0;
+    }
+
+    return (tinyusb_cdc_n_write_raw(port->itf, (const uint8_t *)buf, (rt_size_t)n) == n) ? 1 : 0;
+}
+
+/* 把该路接收队列里已攒下的帧一次送出，返回送出的帧数 */
+static int slcan_pump_tx(slcan_port_t *port)
+{
+    can_rx_frame_t frame;
+    int sent = 0;
+
+    while (sent < SLCAN_TX_BATCH && can_bus_pop_rx(port->bus, &frame))
+    {
+        if (slcan_write_frame(port, &frame)) port->tx_frames++;
+        else                                 port->tx_drop++;
+        sent++;
+    }
+
+    if (sent > 0)
+    {
+        tinyusb_cdc_n_flush_tx(port->itf);
+    }
+
+    return sent;
 }
 
 /* ------------------------------------------------------------------ */
@@ -313,46 +398,6 @@ static rt_err_t slcan_send_frame(slcan_port_t *port, char type)
 }
 
 /* ------------------------------------------------------------------ */
-/* CAN -> 主机                                                         */
-/* ------------------------------------------------------------------ */
-
-int slcan_send_rx(int bus, const FDCAN_RxHeaderTypeDef *header, const uint8_t *data, uint8_t len)
-{
-    slcan_port_t *port = slcan_port_of_bus(bus);
-    char buf[SLCAN_LINE_MAX];
-    rt_bool_t ext = (header->IdType == FDCAN_EXTENDED_ID);
-    rt_bool_t rtr = (header->RxFrameType == FDCAN_REMOTE_FRAME);
-    rt_bool_t fd  = (header->FDFormat == FDCAN_FD_CAN);
-    rt_bool_t brs = (header->BitRateSwitch == FDCAN_BRS_ON);
-    char type;
-    int dlc;
-    int n = 0;
-
-    if (port == RT_NULL || !port->open || len > 64) return 0;
-
-    if (rtr)      type = ext ? 'R' : 'r';
-    else if (fd)  type = brs ? (ext ? 'B' : 'b') : (ext ? 'D' : 'd');
-    else          type = ext ? 'T' : 't';
-
-    dlc = (int)can_len_to_dlc(len);
-    if (dlc == 0xFF) return 0;
-
-    buf[n++] = type;
-    n += rt_snprintf(&buf[n], sizeof(buf) - n, ext ? "%08X" : "%03X", (unsigned)header->Identifier);
-    n += rt_snprintf(&buf[n], sizeof(buf) - n, "%X", (unsigned)dlc);
-
-    for (int i = 0; i < len && n < (int)sizeof(buf) - 3; i++)
-    {
-        uint8_t byte = rtr ? 0u : data[i]; /* 远程帧没有数据段，补 0 保持格式完整 */
-        n += rt_snprintf(&buf[n], sizeof(buf) - n, "%02X", byte);
-    }
-    buf[n++] = '\r';
-
-    slcan_write(port, buf, (rt_size_t)n);
-    return 1;
-}
-
-/* ------------------------------------------------------------------ */
 /* 命令行分发                                                          */
 /* ------------------------------------------------------------------ */
 
@@ -413,8 +458,9 @@ static void slcan_thread_entry(void *parameter)
     while (1)
     {
         int n;
+        int pumped = 0;
 
-        /* 主机拔掉/关闭串口后自动退出打开状态，对应总线恢复本地日志输出 */
+        /* 主机拔掉/关闭串口后自动退出打开状态 */
         if (port->open && !tinyusb_cdc_n_connected(port->itf))
         {
             port->open = RT_FALSE;
@@ -450,12 +496,49 @@ static void slcan_thread_entry(void *parameter)
             }
         }
 
-        if (n <= 0)
+        if (port->open)
+        {
+            pumped = slcan_pump_tx(port);
+        }
+        else
+        {
+            /* 通道没打开时不应积压；丢弃残余帧 */
+            can_rx_frame_t frame;
+            while (can_bus_pop_rx(port->bus, &frame)) { }
+        }
+
+        if (n <= 0 && pumped == 0)
         {
             rt_thread_mdelay(1);
         }
     }
 }
+
+/* 控制台命令：查看两路的收发与丢帧统计 */
+static int canstat(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    for (int bus = 0; bus < SLCAN_PORT_COUNT; bus++)
+    {
+        can_bus_stats_t st;
+
+        can_bus_get_stats(bus, &st);
+        rt_kprintf("CAN%d [%s] rx=%u tx=%u | drop: q=%u hw=%u usb=%u total=%u\n",
+                   bus + 1,
+                   slcan_is_open(bus) ? "open" : "closed",
+                   (unsigned)st.rx_frames,
+                   (unsigned)st.tx_frames,
+                   (unsigned)st.queue_drop,
+                   (unsigned)st.hw_lost,
+                   (unsigned)slcan_tx_drop(bus),
+                   (unsigned)(st.queue_drop + st.hw_lost + slcan_tx_drop(bus)));
+    }
+
+    return 0;
+}
+MSH_CMD_EXPORT(canstat, show per-bus RX/TX and drop counters);
 
 void slcan_init(void)
 {
@@ -465,6 +548,8 @@ void slcan_init(void)
 
         port->line_len = 0;
         port->open = RT_FALSE;
+        port->tx_frames = 0;
+        port->tx_drop = 0;
 
         if (create_thread_param(slcan_thread_entry, port, port->name,
                                 SLCAN_THREAD_STACK, SLCAN_THREAD_PRIORITY,

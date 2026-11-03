@@ -25,7 +25,9 @@ USB 口会出现三个 COM 口（CAN1 / CAN2 / 控制台），可以直接用开
 - **只听模式**：`M1` 进入 FDCAN Bus Monitoring 模式，只监听不应答
 - 双路 CAN FD 初始化：FDCAN1（PD0/PD1）、FDCAN2（PB12/PB13），CAN FD + BRS，最高 64 字节
 - 标准帧 / 扩展帧全通滤波，接收走 RX FIFO0
-- 两路独立的接收线程；对应 SLCAN 通道打开时报文走 USB，否则按十六进制打印到控制台
+- **中断驱动接收**：RX FIFO0 新消息中断唤醒接收线程，64 帧环形队列把接收与 USB 发送解耦
+- **丢帧统计**：`canstat` 查看两路的收发计数、软件队列丢弃、硬件溢出和 USB 背压丢弃
+- 对应 SLCAN 通道打开时报文走 USB，否则按十六进制打印到控制台
 - MSH 命令 `can_tx64`：在 FDCAN2 上发送一帧 64 字节、ID = `0x123` 的 CAN FD+BRS 测试帧
 - USB 全速三路 CDC 设备（TinyUSB）：CDC0 = CAN1 SLCAN、CDC1 = CAN2 SLCAN、CDC2 = 控制台
 - 控制台双通道：优先 USB CDC2，未连接时自动回退到 UART1（PA9/PA10，115200 8N1）
@@ -114,11 +116,11 @@ main()                        // RT-Thread 用户 main 线程
 | --- | --- | --- | --- |
 | `tshell` | 5 | 4096 | finsh/MSH 命令行 |
 | `main` | 10 | 2048 | 启动各组件后空转 |
-| `slcan1` | 19 | 1536 | 解析 CDC0 上的 SLCAN 命令（CAN1） |
-| `slcan2` | 19 | 1536 | 解析 CDC1 上的 SLCAN 命令（CAN2） |
-| `tusbt` | 20 | 2048 | USB 栈轮询（`tud_task()`，1 ms 周期） |
-| `can_rx1` | 20 | 1536 | FDCAN1 接收轮询（SLCAN 打开时转发到 USB） |
-| `can_rx2` | 20 | 1536 | FDCAN2 接收轮询（SLCAN 打开时转发到 USB） |
+| `tusbt` | 17 | 2048 | USB 栈轮询（`tud_task()`） |
+| `can_rx1` | 18 | 1536 | FDCAN1 接收中断处理线程（搬帧进队列） |
+| `can_rx2` | 18 | 1536 | FDCAN2 接收中断处理线程 |
+| `slcan1` | 19 | 1536 | CDC0 命令解析 + CAN1 帧批量发送 |
+| `slcan2` | 19 | 1536 | CDC1 命令解析 + CAN2 帧批量发送 |
 | `tidle` | 31 | 256 | 空闲线程 |
 
 受 `THREAD_MANAGER_MAX_COUNT` 限制，静态线程最多 8 个，单线程栈上限 2048 字节
@@ -231,6 +233,7 @@ make -j
 | --- | --- |
 | `help` | 列出所有 MSH 命令 |
 | `can_tx64` | 在 FDCAN2 上发送 64 字节 CAN FD+BRS 测试帧（ID `0x123`，数据为 0x00~0x3F 自增） |
+| `canstat` | 查看两路收发计数与丢帧统计（见下节） |
 | `usb_test` | 通过 CDC0 发送 `hello world!`（会混入 SLCAN 数据流，仅调试用） |
 | `list_thread` / `ps` | 查看线程与栈使用情况 |
 
@@ -242,12 +245,33 @@ CAN FD RX: CAN1 ID=0x00000123 LEN=64 BRS=1 FDF=1
 10: 10 11 12 13 14 15 16 17 18 19 1A 1B 1C 1D 1E 1F
 ```
 
+## 丢帧统计
+
+接收链路：**FDCAN RX FIFO0 中断 → `can_rx` 线程搬进 64 帧环形队列 → `slcan` 线程批量编码发送**。
+USB 拥塞只会让队列变满，不会阻塞 CAN 接收。
+
+控制台执行 `canstat`：
+
+```
+CAN1 [open]   rx=12480 tx=12475 | drop: q=0 hw=0 usb=5 total=5
+CAN2 [closed] rx=0     tx=0     | drop: q=0 hw=0 usb=0 total=0
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `rx` | 控制器成功收到的帧数 |
+| `tx` | 成功写入发送 FIFO 的帧数（上位机下发的） |
+| `drop q` | 软件接收队列满而丢弃的帧数 |
+| `drop hw` | 观察到 RX FIFO 溢出标志（`RXF0S.RF0L`）的次数 |
+| `drop usb` | USB 发送缓冲不足而整帧丢弃的次数 |
+| `total` | 上述三项之和 |
+
 ## 代码导读
 
 | 文件 | 说明 |
 | --- | --- |
 | `applications/main.c` / `main.h` | 程序入口，`functions[]` 启动函数表 |
-| `applications/can/can.c` | FDCAN 初始化、位时序计算、滤波器、接收线程、SLCAN 发送接口 |
+| `applications/can/can.c` | FDCAN 初始化、位时序计算、滤波器、中断接收、环形队列、统计与发送接口 |
 | `applications/slcan/slcan.c` | 双通道 SLCAN-FD 命令/帧解析、CDC0/CDC1 收发、各路独立状态 |
 | `applications/usb/usb.c` | USB 时钟（HSI48）、`HAL_PCD` 初始化与启动 |
 | `applications/usb/usb_tiny_cdc.c` | TinyUSB 描述符、三路 CDC 读写、DTR 状态、`tud_task` 线程、USB 中断 |
@@ -262,6 +286,7 @@ CAN FD RX: CAN1 ID=0x00000123 LEN=64 BRS=1 FDF=1
 - [ ] 三路 CDC 共享 12 Mbit/s 全速带宽，两路高负载 FD 抓包时可能丢帧
 - [ ] 控制台口也会出现在 CANgaroo 的 SLCAN 接口列表里，添加接口时要避开
 - [ ] 未实现 SLCAN 的 `Z`（时间戳）等可选命令，时间戳由上位机接收时刻生成
+- [ ] `hw_lost` 是“观察到 RX FIFO 溢出标志”的次数（硬件无丢帧计数器），只能作为趋势参考
 - [ ] 未上报 CAN 错误帧 / Bus-Off 状态，也没有错误计数器
 - [ ] 发送采用「入队即应答」，总线错误不会反馈给上位机
 - [ ] 缺少单元测试与 CI

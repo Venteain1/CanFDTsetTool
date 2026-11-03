@@ -203,6 +203,27 @@ void tinyusb_cdc_n_flush(uint8_t itf)
     if (itf >= CFG_TUD_CDC) return;
     tud_cdc_n_read_flush(itf);
 }
+/* 只写入 CDC 发送缓冲，不触发 flush（批量发送用） */
+int tinyusb_cdc_n_write_raw(uint8_t itf, const uint8_t *data, rt_size_t len)
+{
+    if (itf >= CFG_TUD_CDC) return 0;
+    if (!data || len == 0) return 0;
+    if (!tud_cdc_n_connected(itf)) return 0;
+
+    return (int)tud_cdc_n_write(itf, data, (uint32_t)len);
+}
+
+void tinyusb_cdc_n_flush_tx(uint8_t itf)
+{
+    if (itf >= CFG_TUD_CDC) return;
+    tud_cdc_n_write_flush(itf);
+}
+
+uint32_t tinyusb_cdc_n_write_available(uint8_t itf)
+{
+    if (itf >= CFG_TUD_CDC) return 0;
+    return tud_cdc_n_write_available(itf);
+}
 
 /* ---- CDC0 便捷封装（usb_test / SLCAN CAN1） ---- */
 
@@ -297,7 +318,7 @@ void tinyusb_cdc_init(void)
     tusb_init();
 
     if (find_thread("tusbt") == RT_NULL) {
-        rt_err_t ret = create_thread_param(tinyusb_task_entry, RT_NULL, "tusbt", 2048, 20, 10);
+        rt_err_t ret = create_thread_param(tinyusb_task_entry, RT_NULL, "tusbt", 2048, 17, 10);
         if (ret != RT_EOK) {
             USB_LOG("create tinyusb thread failed err=%d\r\n", ret);
         }

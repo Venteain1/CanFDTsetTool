@@ -7,6 +7,7 @@
  * Date           Author       Notes
  * 2025-03-04     BZH1WX       the first version
  * 2025-11-03     Venteain     增加 SLCAN 发送接口与运行时位时序配置
+ * 2025-11-03     Venteain     接收改为中断 + 环形队列，并统计丢帧
  */
 #ifndef APPLICATIONS_CAN_H_
 #define APPLICATIONS_CAN_H_
@@ -25,6 +26,27 @@ typedef struct
     uint8_t  data[64];
 } can_user_msg_t;
 
+/* 接收队列中的一帧（由 RX 中断/线程搬运，供 SLCAN 线程取用） */
+typedef struct
+{
+    uint32_t id;
+    uint8_t  len;
+    uint8_t  extended;
+    uint8_t  remote;
+    uint8_t  fd;
+    uint8_t  brs;
+    uint8_t  data[64];
+} can_rx_frame_t;
+
+/* 每路总线的接收/发送统计 */
+typedef struct
+{
+    uint32_t rx_frames;     /* 控制器成功收到的帧数 */
+    uint32_t tx_frames;     /* 成功写入发送 FIFO 的帧数 */
+    uint32_t queue_drop;    /* 接收队列满而丢弃的帧数（软件丢帧） */
+    uint32_t hw_lost;       /* RX FIFO 溢出事件次数（硬件丢帧，近似值） */
+} can_bus_stats_t;
+
 void can_init(void);
 void can_tx_test_message(void);
 
@@ -37,5 +59,11 @@ rt_err_t can_bus_send(int bus, const can_user_msg_t *msg);
 
 /* 重新配置指定总线的仲裁段/数据段速率，listen_only 为 RT_TRUE 时进入只听模式 */
 rt_err_t can_bus_set_timing(int bus, uint32_t nominal_bps, uint32_t data_bps, rt_bool_t listen_only);
+
+/* 从指定总线的接收队列取一帧，成功返回 1，队列空返回 0 */
+int can_bus_pop_rx(int bus, can_rx_frame_t *frame);
+
+/* 读取指定总线的统计信息 */
+void can_bus_get_stats(int bus, can_bus_stats_t *stats);
 
 #endif /* APPLICATIONS_CAN_H_ */

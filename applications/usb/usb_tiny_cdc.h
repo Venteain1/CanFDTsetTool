@@ -20,6 +20,7 @@ bool tinyusb_cdc_ready(void);     /* DTR/连接状态 */
 
 /* 通用接口：SLCAN 数据通道用，不依赖 DTR，只看 USB 是否连接 */
 bool tinyusb_cdc_n_connected(uint8_t itf);
+bool tinyusb_cdc_dtr(uint8_t itf);   /* 诊断用：主机是否置位 DTR */
 int  tinyusb_cdc_n_write(uint8_t itf, const uint8_t *data, rt_size_t len);
 int  tinyusb_cdc_n_read(uint8_t itf, uint8_t *data, rt_size_t len);
 void tinyusb_cdc_n_flush(uint8_t itf);

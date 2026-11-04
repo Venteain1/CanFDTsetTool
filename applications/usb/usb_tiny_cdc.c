@@ -172,13 +172,19 @@ bool tinyusb_cdc_n_connected(uint8_t itf)
     return tud_cdc_n_connected(itf);
 }
 
+/* 仅用于诊断：主机是否对该接口置位 DTR */
+bool tinyusb_cdc_dtr(uint8_t itf)
+{
+    if (itf >= CFG_TUD_CDC) return false;
+    return g_dtr[itf];
+}
+
 int tinyusb_cdc_n_write(uint8_t itf, const uint8_t *data, rt_size_t len)
 {
     uint32_t w;
 
     if (itf >= CFG_TUD_CDC) return 0;
     if (!data || len == 0) return 0;
-    if (!tud_cdc_n_connected(itf)) return 0;
 
     w = tud_cdc_n_write(itf, data, (uint32_t)len);
     if (w > 0) tud_cdc_n_write_flush(itf);
@@ -192,7 +198,8 @@ int tinyusb_cdc_n_read(uint8_t itf, uint8_t *data, rt_size_t len)
 
     if (itf >= CFG_TUD_CDC) return 0;
     if (!data || len == 0) return 0;
-    if (!tud_cdc_n_connected(itf)) return 0;
+    /* 注意：不检查 DTR。部分上位机打开串口时不会置位 DTR，
+     * 若在这里拦截，'O' 等命令永远收不到，通道会一直显示 closed。 */
 
     avail = tud_cdc_n_available(itf);
     if (avail == 0) return 0;
@@ -211,7 +218,6 @@ int tinyusb_cdc_n_write_raw(uint8_t itf, const uint8_t *data, rt_size_t len)
 {
     if (itf >= CFG_TUD_CDC) return 0;
     if (!data || len == 0) return 0;
-    if (!tud_cdc_n_connected(itf)) return 0;
 
     return (int)tud_cdc_n_write(itf, data, (uint32_t)len);
 }

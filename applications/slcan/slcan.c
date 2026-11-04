@@ -115,8 +115,6 @@ static void slcan_write(slcan_port_t *port, const void *data, rt_size_t len)
     {
         int written;
 
-        if (!tinyusb_cdc_n_connected(port->itf)) return;
-
         written = tinyusb_cdc_n_write(port->itf, p, len);
         if (written > 0)
         {
@@ -174,8 +172,6 @@ static int slcan_write_frame(slcan_port_t *port, const can_rx_frame_t *frame)
         n += rt_snprintf(&buf[n], sizeof(buf) - n, "%02X", byte);
     }
     buf[n++] = '\r';
-
-    if (!tinyusb_cdc_n_connected(port->itf)) return 0;
 
     /* 保证整帧能一次性放进 CDC 缓冲，避免出现半行导致主机解析错位 */
     if (tinyusb_cdc_n_write_available(port->itf) < (uint32_t)n)
@@ -460,13 +456,6 @@ static void slcan_thread_entry(void *parameter)
         int n;
         int pumped = 0;
 
-        /* 主机拔掉/关闭串口后自动退出打开状态 */
-        if (port->open && !tinyusb_cdc_n_connected(port->itf))
-        {
-            port->open = RT_FALSE;
-            port->line_len = 0;
-        }
-
         n = tinyusb_cdc_n_read(port->itf, buf, sizeof(buf));
 
         for (int i = 0; i < n; i++)
@@ -525,9 +514,10 @@ static int canstat(int argc, char **argv)
         can_bus_stats_t st;
 
         can_bus_get_stats(bus, &st);
-        rt_kprintf("CAN%d [%s] rx=%u tx=%u | drop: q=%u hw=%u usb=%u total=%u\n",
+        rt_kprintf("CAN%d [%s] dtr=%d rx=%u tx=%u | drop: q=%u hw=%u usb=%u total=%u\n",
                    bus + 1,
                    slcan_is_open(bus) ? "open" : "closed",
+                   tinyusb_cdc_dtr(bus) ? 1 : 0,
                    (unsigned)st.rx_frames,
                    (unsigned)st.tx_frames,
                    (unsigned)st.queue_drop,
